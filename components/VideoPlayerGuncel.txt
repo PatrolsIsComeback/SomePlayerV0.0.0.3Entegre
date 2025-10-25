@@ -1,0 +1,891 @@
+"use client";
+
+import { useRef, useState, useEffect, useCallback } from 'react';
+import { 
+  Play, Pause, Volume2, VolumeX, Maximize, Minimize, 
+  SkipBack, SkipForward, Settings, Repeat, Repeat1, ChevronLeft,
+  FastForward, Rewind 
+} from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Slider } from '@/components/ui/slider';
+import { cn } from '@/lib/utils';
+
+// Saniye cinsinden atlama miktarı
+const SEEK_SECONDS = 10;
+// Uzun basma algılama süresi (ms)
+const LONG_PRESS_DELAY = 500;
+// Çift tıklama algılama aralığı (ms)
+const DOUBLE_CLICK_INTERVAL = 300;
+// Thumbnail önbellek yenileme aralığı (saniye)
+const THUMBNAIL_UPDATE_INTERVAL = 1.0;
+
+interface VideoPlayerProps {
+  src: string;
+  poster?: string;
+  className?: string;
+}
+
+// Zaman formatlama işlevi (dışarıya taşındı)
+const formatTime = (time: number): string => {
+  const hours = Math.floor(time / 3600);
+  const minutes = Math.floor((time % 3600) / 60);
+  const seconds = Math.floor(time % 60);
+
+  if (hours > 0) {
+    return `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+  }
+  return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+};
+
+// Birleşik olay tipi tanımı
+type ProgressInteractionEvent = React.MouseEvent<HTMLDivElement> | React.TouchEvent<HTMLDivElement>;
+
+export function VideoPlayer({ src, poster, className }: VideoPlayerProps) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const thumbnailCanvasRef = useRef<HTMLCanvasElement>(null);
+
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [volume, setVolume] = useState(1);
+  const [isMuted, setIsMuted] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [showControls, setShowControls] = useState(true);
+  const [isBuffering, setIsBuffering] = useState(false);
+  const [playbackRate, setPlaybackRate] = useState(1);
+  const [showSettings, setShowSettings] = useState(false);
+  const [settingsView, setSettingsView] = useState<'main' | 'speed' | 'quality'>('main');
+  const [quality, setQuality] = useState('auto');
+  const [isTouchDevice, setIsTouchDevice] = useState(false);
+  
+  const [isDraggingProgress, setIsDraggingProgress] = useState(false);
+  const [loop, setLoop] = useState<'none' | 'all' | 'one'>('none');
+  
+  const [isHoveringProgress, setIsHoveringProgress] = useState(false);
+  const [hoverTime, setHoverTime] = useState(0);
+  const [thumbnailPosition, setThumbnailPosition] = useState(0);
+
+  const [isLongPressing, setIsLongPressing] = useState(false);
+  const [savedPlaybackRate, setSavedPlaybackRate] = useState(1);
+  const [skipIndicator, setSkipIndicator] = useState<{ show: boolean; direction: 'forward' | 'backward'; count: number; position: 'left' | 'right' }>({ show: false, direction: 'forward', count: 0, position: 'right' });
+  
+  // Çift tıklama için durum yönetimi
+  const lastClickTime = useRef(0);
+  const singleClickTimeout = useRef<NodeJS.Timeout>();
+
+  const hideControlsTimeout = useRef<NodeJS.Timeout>();
+  const longPressTimeout = useRef<NodeJS.Timeout>();
+  const skipIndicatorTimeout = useRef<NodeJS.Timeout>();
+  
+  // Thumbnail Cache Sistemi (Performans için)
+  const thumbnailCache = useRef<Map<number, string>>(new Map());
+  const thumbnailVideoRef = useRef<HTMLVideoElement | null>(null);
+  const isGeneratingThumbnail = useRef(false);
+
+  // Kontrol Çubuğu Mantığı: Fare hareketinde göster/oynatılırken gizle
+  const handleMouseMove = () => {
+    setShowControls(true);
+    if (hideControlsTimeout.current) {
+      clearTimeout(hideControlsTimeout.current);
+    }
+    if (isPlaying) {
+      hideControlsTimeout.current = setTimeout(() => {
+        setShowControls(false);
+        setShowSettings(false); // Ayarları da gizle
+      }, 3000);
+    }
+  };
+
+  // Video oynatma/durdurma işlevi
+  const togglePlay = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    if (video.paused) {
+      video.play().catch(err => console.error('Play error:', err));
+    } else {
+      video.pause();
+    }
+  }, []);
+  
+  // Sesi açma/kapatma
+  const toggleMute = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    if (isMuted || video.volume === 0) {
+      video.volume = volume || 0.5; 
+      setIsMuted(false);
+    } else {
+      setVolume(video.volume); 
+      video.volume = 0;
+      setIsMuted(true);
+    }
+  }, [isMuted, volume]);
+
+  // Tam ekran değiştirme
+  const toggleFullscreen = useCallback(async () => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    try {
+      if (!document.fullscreenElement) {
+        await container.requestFullscreen();
+      } else {
+        await document.exitFullscreen();
+      }
+    } catch (error) {
+      console.error('Fullscreen error:', error);
+    }
+  }, []);
+
+
+  // Atlama göstergesi fonksiyonunu tanımla
+  const showSkipIndicator = useCallback((direction: 'forward' | 'backward', position: 'left' | 'right') => {
+    setSkipIndicator(prev => ({
+      show: true,
+      direction,
+      position,
+      count: prev.show && prev.direction === direction ? prev.count + 1 : 1
+    }));
+
+    if (skipIndicatorTimeout.current) {
+      clearTimeout(skipIndicatorTimeout.current);
+    }
+
+    skipIndicatorTimeout.current = setTimeout(() => {
+      setSkipIndicator({ show: false, direction: 'forward', count: 0, position: 'right' });
+    }, 800);
+  }, []);
+
+  // Videoda atlama işlevi
+  const skip = useCallback((seconds: number) => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    const newTime = Math.max(0, Math.min(duration, video.currentTime + seconds));
+    video.currentTime = newTime;
+    setCurrentTime(newTime);
+
+    // Atlama göstergesini göster (Konum dinamik olarak belirlendi)
+    showSkipIndicator(seconds > 0 ? 'forward' : 'backward', seconds > 0 ? 'right' : 'left');
+
+  }, [duration, showSkipIndicator]);
+
+
+  // Thumbnail oluşturma işlevi (Optimizasyonlu)
+  const generateThumbnail = useCallback(async (time: number) => {
+    if (isGeneratingThumbnail.current || !videoRef.current || !thumbnailCanvasRef.current) return;
+
+    const cacheKey = Math.floor(time / THUMBNAIL_UPDATE_INTERVAL) * THUMBNAIL_UPDATE_INTERVAL;
+    
+    if (thumbnailCache.current.has(cacheKey)) {
+        return thumbnailCache.current.get(cacheKey);
+    }
+    
+    isGeneratingThumbnail.current = true;
+    
+    if (!thumbnailVideoRef.current) {
+        thumbnailVideoRef.current = document.createElement('video');
+        thumbnailVideoRef.current.muted = true;
+        thumbnailVideoRef.current.preload = 'metadata';
+        thumbnailVideoRef.current.src = videoRef.current.src; 
+    }
+    
+    const tempVideo = thumbnailVideoRef.current;
+    const canvas = thumbnailCanvasRef.current;
+    const ctx = canvas.getContext('2d');
+    
+    if (!ctx) {
+        isGeneratingThumbnail.current = false;
+        return;
+    }
+    
+    tempVideo.currentTime = time;
+    
+    await new Promise<void>((resolve) => {
+        const handleSeeked = () => {
+            tempVideo.removeEventListener('seeked', handleSeeked);
+            resolve();
+        };
+        if (tempVideo.readyState < 2) { 
+            tempVideo.addEventListener('seeked', handleSeeked);
+        } else {
+            handleSeeked();
+        }
+    });
+
+    // Thumbnail çizimi
+    canvas.width = 160;
+    canvas.height = 90;
+    ctx.drawImage(tempVideo, 0, 0, 160, 90);
+    
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+    
+    if (thumbnailCache.current.size < 50) { 
+        thumbnailCache.current.set(cacheKey, dataUrl);
+    }
+
+    isGeneratingThumbnail.current = false;
+    return dataUrl;
+
+  }, [src]);
+
+  // Zaman çubuğu etkileşimi (fare/dokunmatik)
+  const handleProgressInteraction = useCallback(async (e: ProgressInteractionEvent) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    
+    const clientX = 'touches' in e ? e.touches[0].clientX : (e as React.MouseEvent<HTMLDivElement>).clientX;
+    
+    const pos = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)); 
+    const time = pos * duration;
+
+    setHoverTime(time);
+    setThumbnailPosition(Math.max(80, Math.min(rect.width - 80, clientX - rect.left))); 
+
+    // Thumbnail yükleme/gösterme
+    const thumbnailDataUrl = await generateThumbnail(time);
+    
+    if (thumbnailCanvasRef.current && thumbnailDataUrl) {
+      const canvas = thumbnailCanvasRef.current;
+      const ctx = canvas.getContext('2d');
+      const img = new Image();
+      img.onload = () => {
+        if (ctx) {
+          canvas.width = 160;
+          canvas.height = 90;
+          ctx.drawImage(img, 0, 0, 160, 90);
+        }
+      };
+      img.src = thumbnailDataUrl;
+    }
+
+  }, [duration, generateThumbnail]);
+  
+  // Progress Bar Dokunmatik Başlangıç
+  const handleProgressTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    setIsDraggingProgress(true);
+    setIsHoveringProgress(true);
+    handleProgressInteraction(e);
+  };
+
+  // Progress Bar Dokunmatik Hareket
+  const handleProgressTouchMove = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (isDraggingProgress) {
+      e.stopPropagation();
+      handleProgressInteraction(e);
+    }
+  };
+
+  // Progress Bar Dokunmatik Bitiş
+  const handleProgressTouchEnd = (e: React.TouchEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    setIsDraggingProgress(false);
+    
+    const rect = e.currentTarget.getBoundingClientRect();
+    const clientX = e.changedTouches[0].clientX; 
+    
+    const pos = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    const time = pos * duration;
+    handleSeek([time]);
+
+    setTimeout(() => setIsHoveringProgress(false), 200);
+  };
+
+  // Zaman arama (Slider)
+  const handleSeek = (value: number[]) => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    video.currentTime = value[0];
+    setCurrentTime(value[0]);
+  };
+
+  // Ses seviyesi değiştirme
+  const handleVolumeChange = (value: number[]) => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    const newVolume = value[0];
+    video.volume = newVolume;
+    setVolume(newVolume);
+    setIsMuted(newVolume === 0); 
+  };
+
+
+  // Olay Dinleyicileri (useEffect)
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    const handleLoadedMetadata = () => {
+      setDuration(video.duration);
+      video.volume = volume; 
+    };
+
+    const handleTimeUpdate = () => {
+      setCurrentTime(video.currentTime);
+    };
+
+    const handleWaiting = () => {
+      setIsBuffering(true);
+    };
+
+    const handleCanPlay = () => {
+      setIsBuffering(false);
+    };
+
+    const handlePlay = () => {
+      setIsPlaying(true);
+      handleMouseMove(); 
+    };
+
+    const handlePause = () => {
+      setIsPlaying(false);
+      if (hideControlsTimeout.current) {
+        clearTimeout(hideControlsTimeout.current);
+      }
+      setShowControls(true);
+    };
+
+    const handleEnded = () => {
+      if (loop === 'one') {
+        video.currentTime = 0;
+        video.play();
+      } else if (loop === 'none') {
+        setIsPlaying(false);
+      }
+    };
+    
+    video.addEventListener('loadedmetadata', handleLoadedMetadata);
+    video.addEventListener('timeupdate', handleTimeUpdate);
+    video.addEventListener('waiting', handleWaiting);
+    video.addEventListener('canplay', handleCanPlay);
+    video.addEventListener('play', handlePlay);
+    video.addEventListener('pause', handlePause);
+    video.addEventListener('ended', handleEnded);
+
+    return () => {
+      video.removeEventListener('loadedmetadata', handleLoadedMetadata);
+      video.removeEventListener('timeupdate', handleTimeUpdate);
+      video.removeEventListener('waiting', handleWaiting);
+      video.removeEventListener('canplay', handleCanPlay);
+      video.removeEventListener('play', handlePlay);
+      video.removeEventListener('pause', handlePause);
+      video.removeEventListener('ended', handleEnded);
+      
+      if (thumbnailVideoRef.current) {
+        thumbnailVideoRef.current.src = '';
+        thumbnailVideoRef.current.load();
+        thumbnailVideoRef.current = null;
+      }
+    };
+  }, [loop, volume, handleMouseMove]); 
+
+  // Tam ekran ve Dokunmatik Cihaz Kontrolü
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(!!document.fullscreenElement);
+    };
+
+    const checkTouchDevice = () => {
+      setIsTouchDevice('ontouchstart' in window || navigator.maxTouchPoints > 0);
+    };
+
+    checkTouchDevice();
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', handleFullscreenChange);
+    };
+  }, []);
+
+  // Klavye Kontrolleri
+  useEffect(() => {
+    const handleKeyPress = (e: KeyboardEvent) => {
+      const video = videoRef.current;
+      if (!video) return;
+
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+
+      switch (e.key.toLowerCase()) {
+        case ' ':
+        case 'k':
+          e.preventDefault();
+          togglePlay();
+          break;
+        case 'arrowleft':
+        case 'j':
+          e.preventDefault();
+          skip(-SEEK_SECONDS);
+          break;
+        case 'arrowright':
+        case 'l':
+          e.preventDefault();
+          skip(SEEK_SECONDS);
+          break;
+        case 'm':
+          e.preventDefault();
+          toggleMute(); 
+          break;
+        case 'f':
+          e.preventDefault();
+          toggleFullscreen();
+          break;
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyPress);
+    return () => window.removeEventListener('keydown', handleKeyPress);
+  }, [togglePlay, skip, toggleMute, toggleFullscreen]); 
+  
+  // Oynatma hızı değiştirme
+  const changePlaybackRate = (rate: number) => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    video.playbackRate = rate;
+    setPlaybackRate(rate);
+    setSettingsView('main');
+  };
+  
+  // Tekrarlama modunu değiştirme
+  const toggleLoop = () => {
+    const modes: Array<'none' | 'one'> = ['none', 'one']; 
+    const currentIndex = modes.indexOf(loop === 'all' ? 'none' : loop); 
+    const nextMode = modes[(currentIndex + 1) % modes.length];
+    setLoop(nextMode);
+  };
+  
+  // Çift tıklama/Tek tıklama mantığı için ana konteyner olay işleyicisi
+  const handlePlayerClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (isDraggingProgress || isLongPressing) return;
+    
+    if (showSettings) {
+        e.stopPropagation();
+        closeSettings();
+        return;
+    }
+
+    const now = Date.now();
+
+    if (now - lastClickTime.current < DOUBLE_CLICK_INTERVAL) {
+      // Çift Tıklama
+      clearTimeout(singleClickTimeout.current!);
+      lastClickTime.current = 0;
+      
+      const rect = e.currentTarget.getBoundingClientRect();
+      const clickX = e.clientX;
+      const midPoint = rect.left + rect.width / 2;
+
+      if (clickX < midPoint) {
+        skip(-SEEK_SECONDS);
+      } else {
+        skip(SEEK_SECONDS);
+      }
+    } else {
+      // Tek Tıklama Adayı
+      lastClickTime.current = now;
+      singleClickTimeout.current = setTimeout(() => {
+        if (Date.now() - now >= DOUBLE_CLICK_INTERVAL) {
+          togglePlay();
+          lastClickTime.current = 0;
+        }
+      }, DOUBLE_CLICK_INTERVAL);
+    }
+  };
+  
+  // Uzun Basma (Long Press) Başlangıcı
+  const handleLongPressStart = (e: React.TouchEvent<HTMLDivElement | HTMLVideoElement>) => {
+    if (isDraggingProgress) return;
+    
+    const video = videoRef.current;
+    if (!video) return;
+    
+    e.preventDefault(); 
+
+    longPressTimeout.current = setTimeout(() => {
+      setIsLongPressing(true);
+      setSavedPlaybackRate(video.playbackRate);
+      video.playbackRate = 2.0; 
+      
+      if (video.paused) {
+        video.play().catch(err => console.error('Play error during long press:', err));
+      }
+      
+    }, LONG_PRESS_DELAY);
+  };
+
+  // Uzun Basma (Long Press) Sonu
+  const handleLongPressEnd = () => {
+    if (longPressTimeout.current) {
+      clearTimeout(longPressTimeout.current);
+    }
+
+    if (isLongPressing) {
+      const video = videoRef.current;
+      if (video) {
+        video.playbackRate = savedPlaybackRate; 
+      }
+      setIsLongPressing(false);
+    }
+  };
+  
+  // Ayarları kapat
+  const closeSettings = () => {
+    setShowSettings(false);
+    setSettingsView('main');
+  };
+  
+  // Kalite değiştirme (Placeholder)
+  const changeQuality = (newQuality: string) => {
+    setQuality(newQuality);
+    setSettingsView('main');
+  };
+
+
+  return (
+    <div
+      ref={containerRef}
+      className={cn("relative bg-black rounded-lg overflow-hidden group focus:outline-none", className)}
+      onMouseMove={handleMouseMove}
+      onMouseLeave={() => isPlaying && setShowControls(false)}
+      tabIndex={0} 
+    >
+      {/* Çift Tıklama/Uzun Basma/Tek Tıklama Alanı */}
+      <div
+        className="absolute inset-0 flex z-10"
+        onContextMenu={(e) => e.preventDefault()}
+      >
+        <div 
+          className="flex-1"
+          onClick={handlePlayerClick}
+          onTouchStart={handleLongPressStart}
+          onTouchEnd={handleLongPressEnd}
+          onTouchCancel={handleLongPressEnd}
+        />
+      </div>
+
+      <video
+        ref={videoRef}
+        src={src}
+        poster={poster}
+        className="w-full h-full object-contain pointer-events-none" 
+      />
+
+      {/* Ekran Ortası Durum Göstergeleri */}
+      <div className="absolute inset-0 pointer-events-none z-20">
+        
+        {/* Buffering Göstergesi (Arka planı kaldırıldı) */}
+        {isBuffering && (
+          <div className="absolute inset-0 flex items-center justify-center">
+            <div className="w-16 h-16 border-4 border-white/30 border-t-white rounded-full animate-spin" />
+          </div>
+        )}
+
+        {/* 2x Hız Göstergesi (Sağ üste taşındı) */}
+        {isLongPressing && (
+          <div className="absolute top-4 right-4 bg-black/70 px-3 py-1.5 rounded-lg shadow-lg pointer-events-none transition-opacity duration-150">
+            <div className="text-white text-sm font-bold">2.0x Hız</div>
+          </div>
+        )}
+
+        {/* Atlama Göstergesi (Konum ve Boyut Küçültüldü) */}
+        {skipIndicator.show && (
+          <div 
+            className={cn(
+                "absolute top-1/2 transform -translate-y-1/2 bg-black/60 backdrop-blur-sm rounded-xl py-3 px-4 transition-all duration-150 ease-out flex flex-col items-center",
+                skipIndicator.position === 'left' ? "left-4" : "right-4"
+            )}
+          >
+            <div className="text-white text-xl font-medium mb-1">
+              {skipIndicator.count * SEEK_SECONDS} s
+            </div>
+            <div className="text-white">
+              {skipIndicator.direction === 'forward' ? 
+                <FastForward className="h-6 w-6" /> : 
+                <Rewind className="h-6 w-6" />
+              }
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Başlat Düğmesi (Pause durumunda) */}
+      {!isPlaying && !isBuffering && (
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-20">
+          <div
+            onClick={(e) => {
+              e.stopPropagation();
+              togglePlay();
+            }}
+            className="w-20 h-20 rounded-full bg-white/90 hover:bg-white transition-all hover:scale-110 flex items-center justify-center cursor-pointer pointer-events-auto"
+          >
+            <Play className="h-10 w-10 text-black ml-1" />
+          </div>
+        </div>
+      )}
+
+      {/* Kontrol Çubuğu Arka Planı ve İçeriği */}
+      <div
+        className={cn(
+          "absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-black/40 transition-opacity duration-300 pointer-events-none",
+          showControls ? "opacity-100" : "opacity-0"
+        )}
+      />
+
+      <div
+        className={cn(
+          "absolute bottom-0 left-0 right-0 p-4 space-y-2 transition-transform duration-300 z-30",
+          showControls ? "translate-y-0" : "translate-y-full pointer-events-none"
+        )}
+        onMouseEnter={() => setShowControls(true)} 
+      >
+        {/* Progress Bar ve Thumbnail */}
+        <div
+          className="relative group/progress"
+          onMouseEnter={() => !isTouchDevice && setIsHoveringProgress(true)}
+          onMouseLeave={() => !isTouchDevice && setIsHoveringProgress(false)}
+          onMouseMove={(e) => !isTouchDevice && handleProgressInteraction(e)}
+          onTouchStart={handleProgressTouchStart}
+          onTouchMove={handleProgressTouchMove}
+          onTouchEnd={handleProgressTouchEnd}
+        >
+          <Slider
+            value={[currentTime]}
+            max={duration || 100}
+            step={0.1}
+            onValueChange={handleSeek}
+            className="cursor-pointer"
+          />
+
+          {/* Thumbnail Göstergesi */}
+          {(isHoveringProgress || isDraggingProgress) && duration > 0 && (
+            <div
+              className="absolute bottom-full mb-2 transform -translate-x-1/2 pointer-events-none z-50"
+              style={{ left: `${thumbnailPosition}px` }}
+            >
+              <div className="bg-black/95 rounded-lg p-2 shadow-xl border border-white/20">
+                <canvas
+                  ref={thumbnailCanvasRef}
+                  className="rounded mb-2"
+                  width="160"
+                  height="90"
+                />
+                <div className="text-white text-xs font-medium text-center">
+                  {formatTime(hoverTime)}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Kontrol Düğmeleri */}
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            {/* Play/Pause */}
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={togglePlay}
+              className="text-white hover:bg-white/20"
+            >
+              {isPlaying ? <Pause className="h-5 w-5" /> : <Play className="h-5 w-5 ml-0.5" />}
+            </Button>
+
+            {/* Geri Atlama */}
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => skip(-SEEK_SECONDS)}
+              className="text-white hover:bg-white/20 hidden sm:flex"
+            >
+              <SkipBack className="h-5 w-5" />
+            </Button>
+
+            {/* İleri Atlama */}
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => skip(SEEK_SECONDS)}
+              className="text-white hover:bg-white/20 hidden sm:flex"
+            >
+              <SkipForward className="h-5 w-5" />
+            </Button>
+
+            {/* Ses Kontrolü */}
+            <div className="hidden sm:flex items-center gap-2 ml-2 group/volume">
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={toggleMute}
+                className="text-white hover:bg-white/20"
+              >
+                {isMuted || (volume === 0 && !isMuted) ? (
+                  <VolumeX className="h-5 w-5" />
+                ) : (
+                  <Volume2 className="h-5 w-5" />
+                )}
+              </Button>
+
+              <div className="w-0 overflow-hidden group-hover/volume:w-24 transition-all duration-300">
+                <Slider
+                  value={[isMuted ? 0 : volume]}
+                  max={1}
+                  step={0.01}
+                  onValueChange={handleVolumeChange}
+                  className="cursor-pointer"
+                />
+              </div>
+            </div>
+
+            {/* Zaman Göstergesi */}
+            <span className="text-white text-sm font-medium ml-2 hidden sm:inline">
+              {formatTime(currentTime)} / {formatTime(duration)}
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            {/* Loop Kontrolü */}
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={toggleLoop}
+              className={cn(
+                "text-white hover:bg-white/20 hidden sm:flex",
+                loop !== 'none' && "text-blue-400"
+              )}
+              title={loop === 'none' ? 'Tekrar yok' : 'Bir kez tekrarla'}
+            >
+              {loop === 'one' ? <Repeat1 className="h-5 w-5" /> : <Repeat className="h-5 w-5" />}
+            </Button>
+            
+            {/* Ayarlar Menüsü */}
+            <div className="relative">
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => {
+                    setShowSettings(!showSettings);
+                    setSettingsView('main');
+                }}
+                className="text-white hover:bg-white/20"
+              >
+                <Settings className="h-5 w-5" />
+              </Button>
+
+              {showSettings && (
+                <div className="absolute bottom-full right-0 mb-2 bg-black/95 backdrop-blur-sm rounded-lg overflow-hidden min-w-[200px] shadow-2xl border border-white/10">
+                  {/* Ana Ayarlar */}
+                  {settingsView === 'main' && (
+                    <div className="py-2">
+                      <button
+                        onClick={() => setSettingsView('quality')}
+                        className="w-full flex items-center justify-between px-4 py-2.5 text-sm hover:bg-white/10 transition-colors text-white"
+                      >
+                        <span>Kalite</span>
+                        <div className="flex items-center gap-2 text-slate-300">
+                          <span className="text-xs">{quality}</span>
+                          <ChevronLeft className="h-4 w-4 rotate-180" />
+                        </div>
+                      </button>
+                      <button
+                        onClick={() => setSettingsView('speed')}
+                        className="w-full flex items-center justify-between px-4 py-2.5 text-sm hover:bg-white/10 transition-colors text-white"
+                      >
+                        <span>Hız</span>
+                        <div className="flex items-center gap-2 text-slate-300">
+                          <span className="text-xs">{playbackRate === 1 ? 'Normal' : `${playbackRate}x`}</span>
+                          <ChevronLeft className="h-4 w-4 rotate-180" />
+                        </div>
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Kalite Ayarları */}
+                  {settingsView === 'quality' && (
+                    <div className="py-2">
+                      <div className="flex items-center gap-2 px-4 py-2 border-b border-white/10">
+                        <button
+                          onClick={() => setSettingsView('main')}
+                          className="text-white hover:text-slate-300 transition-colors"
+                        >
+                          <ChevronLeft className="h-4 w-4" />
+                        </button>
+                        <span className="text-white text-sm font-medium">Kalite</span>
+                      </div>
+                      {['auto', '1080p', '720p', '480p', '360p'].map((q) => (
+                        <button
+                          key={q}
+                          onClick={() => changeQuality(q)}
+                          className={cn(
+                            "w-full text-left px-4 py-2.5 text-sm hover:bg-white/10 transition-colors",
+                            quality === q ? "text-blue-400 bg-white/5" : "text-white"
+                          )}
+                        >
+                          <div className="flex items-center justify-between">
+                            <span>{q === 'auto' ? 'Otomatik' : q}</span>
+                            {quality === q && (
+                              <div className="w-1.5 h-1.5 rounded-full bg-blue-400" />
+                            )}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Hız Ayarları */}
+                  {settingsView === 'speed' && (
+                    <div className="py-2">
+                      <div className="flex items-center gap-2 px-4 py-2 border-b border-white/10">
+                        <button
+                          onClick={() => setSettingsView('main')}
+                          className="text-white hover:text-slate-300 transition-colors"
+                        >
+                          <ChevronLeft className="h-4 w-4" />
+                        </button>
+                        <span className="text-white text-sm font-medium">Oynatma Hızı</span>
+                      </div>
+                      {[0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map((rate) => (
+                        <button
+                          key={rate}
+                          onClick={() => changePlaybackRate(rate)}
+                          className={cn(
+                            "w-full text-left px-4 py-2.5 text-sm hover:bg-white/10 transition-colors",
+                            playbackRate === rate ? "text-blue-400 bg-white/5" : "text-white"
+                          )}
+                        >
+                          <div className="flex items-center justify-between">
+                            <span>{rate === 1 ? 'Normal' : `${rate}x`}</span>
+                            {playbackRate === rate && (
+                              <div className="w-1.5 h-1.5 rounded-full bg-blue-400" />
+                            )}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Tam Ekran */}
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={toggleFullscreen}
+              className="text-white hover:bg-white/20"
+            >
+              {isFullscreen ? (
+                <Minimize className="h-5 w-5" />
+              ) : (
+                <Maximize className="h-5 w-5" />
+              )}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
